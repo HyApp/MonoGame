@@ -9,15 +9,15 @@ using Microsoft.Xna.Framework.Content.Pipeline.Builder.Convertors;
 
 namespace MonoGame.Tools.Pipeline
 {
-    internal enum BuildAction
+    public enum BuildAction
     {
         Build,
         Copy,
     }
 
-    internal class ContentItem : IProjectItem
+    public class ContentItem : IProjectItem
     {
-        public IController Controller;
+        public IContentItemObserver Observer;
         
         public string ImporterName;
         public string ProcessorName;
@@ -55,6 +55,8 @@ namespace MonoGame.Tools.Pipeline
         [Browsable(false)]
         public string Icon { get; set; }
 
+        public bool Exists { get; set; }
+
         #endregion
 
         [Category("Settings")]
@@ -70,8 +72,8 @@ namespace MonoGame.Tools.Pipeline
 
                 _buildAction = value;
 
-                if (Controller != null)
-                    Controller.OnItemModified(this);
+                if (Observer != null)
+                    Observer.OnItemModified(this);
             }
         }
 
@@ -97,8 +99,8 @@ namespace MonoGame.Tools.Pipeline
                     Processor = PipelineTypes.FindProcessor(_importer.DefaultProcessor, _importer);
                 }
 
-                if (Controller != null)
-                    Controller.OnItemModified(this);
+                if (Observer != null)
+                    Observer.OnItemModified(this);
             }
         }
 
@@ -125,8 +127,8 @@ namespace MonoGame.Tools.Pipeline
                     ProcessorParams.Add(p.Name, p.DefaultValue);
                 }
 
-                if (Controller != null)
-                    Controller.OnItemModified(this);
+                if (Observer != null)
+                    Observer.OnItemModified(this);
 
                 // Note:
                 // There is no need to validate that the new processor can accept input

@@ -11,10 +11,8 @@ using Microsoft.Xna.Framework.Graphics;
 
 namespace MonoGame.Tools.Pipeline
 {
-    internal class PipelineProject : IProjectItem
+    public class PipelineProject : IProjectItem
     {        
-        public IController Controller;      
-  
         public string OriginalPath { get; set; }
 
         public List<ContentItem> ContentItems { get; private set; }                
@@ -60,6 +58,8 @@ namespace MonoGame.Tools.Pipeline
 
         [Browsable(false)]
         public string Icon { get; set; }
+
+        public bool Exists { get; set; }
 
         #endregion
 

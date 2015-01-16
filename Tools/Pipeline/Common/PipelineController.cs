@@ -7,12 +7,17 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
+using MGCB;
+using PathHelper = MonoGame.Framework.Content.Pipeline.Builder.PathHelper;
 
 namespace MonoGame.Tools.Pipeline
 {
     internal partial class PipelineController : IController
     {
+        private FileSystemWatcher watcher;
+
         private readonly IView _view;
         private PipelineProject _project;
 
@@ -30,6 +35,7 @@ namespace MonoGame.Tools.Pipeline
             "../../../../../MGCB/bin/Windows/AnyCPU/Release",
 #endif
             "../MGCB",
+            Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location),
         };
 
         public IEnumerable<ContentItemTemplate> Templates
@@ -71,11 +77,10 @@ namespace MonoGame.Tools.Pipeline
             _view = view;
             _view.Attach(this);
             _project = project;
-            _project.Controller = this;
             ProjectOpen = false;
 
             _templateItems = new List<ContentItemTemplate>();
-            LoadTemplates(Environment.CurrentDirectory + "\\Templates");
+            LoadTemplates(Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "Templates"));
         }
 
         public void OnProjectModified()
@@ -109,8 +114,9 @@ namespace MonoGame.Tools.Pipeline
             if (!AskSaveProject())
                 return;
 
-           // Ask user to choose a location on disk for the new project.
-            // Note: It is impossible to have a project without a project root directory, hence it has to be saved immediately.
+            // A project needs a root directory or it is impossible to resolve relative paths.
+            // So we need the user to choose that location even though the project has not
+            // yet actually been saved to disk.
             var projectFilePath = Environment.CurrentDirectory;
             if (!_view.AskSaveName(ref projectFilePath, "New Project"))
                 return;
@@ -128,8 +134,7 @@ namespace MonoGame.Tools.Pipeline
             // Save the new project.
             _project.OriginalPath = projectFilePath;
             ProjectOpen = true;
-            History.Default.AddProjectHistory(projectFilePath);
-            History.Default.Save();
+            ProjectDirty = true;
 
             UpdateTree();
 
@@ -165,9 +170,7 @@ namespace MonoGame.Tools.Pipeline
                 ResolveTypes();                
                 
                 ProjectOpen = true;
-                ProjectDirty = true;
-                History.Default.AddProjectHistory(projectFilePath);
-                History.Default.Save();
+                ProjectDirty = true;                
             }
 #if SHIPPING
             catch (Exception e)
@@ -210,13 +213,35 @@ namespace MonoGame.Tools.Pipeline
             {
                 _actionStack.Clear();
                 _project = new PipelineProject();
+                
                 var parser = new PipelineProjectParser(this, _project);
-                parser.OpenProject(projectFilePath);
+                var errorCallback = new MGBuildParser.ErrorCallback((msg, args) => View.OutputAppend(string.Format(Path.GetFileName(projectFilePath) + ": " + msg, args)));
+                parser.OpenProject(projectFilePath, errorCallback);
+
                 ResolveTypes();
 
                 ProjectOpen = true;
                 ProjectDirty = false;
+
+                watcher = new FileSystemWatcher (Path.GetDirectoryName (projectFilePath));
+                watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.FileName;
+                watcher.Filter = "*.*";
+                watcher.IncludeSubdirectories = true;
+                watcher.Created += delegate(object sender, FileSystemEventArgs e) {
+                    HandleCreated(e.FullPath);
+                };
+                watcher.Deleted += delegate(object sender, FileSystemEventArgs e) {
+                    HandleDeleted(e.FullPath);
+                };
+                watcher.Renamed += delegate(object sender, RenamedEventArgs e) {
+                    HandleDeleted(e.OldFullPath);
+                    HandleCreated(e.FullPath);
+                };
+
+                watcher.EnableRaisingEvents = true;
+
                 History.Default.AddProjectHistory(projectFilePath);
+                History.Default.StartupProject = projectFilePath;
                 History.Default.Save();
             }
 #if SHIPPING
@@ -233,18 +258,60 @@ namespace MonoGame.Tools.Pipeline
                 OnProjectLoaded();
         }
 
+        void HandleCreated (string path)
+        {
+            SetExists (path, true);
+        }
+
+        void HandleDeleted (string path)
+        {
+            SetExists (path, false);
+        }
+
+        void SetExists(string path, bool exist)
+        {
+            if (_project != null) {
+                var projectDir = _project.Location;
+
+                #if WINDOWS
+                projectDir += "\\";
+                #else
+                projectDir += "/";
+                #endif
+
+                IProjectItem item = GetItem (PathHelper.GetRelativePath (projectDir, path));
+                if (item != null) {
+                    if (item.Exists == !exist) {
+                        item.Exists = exist;
+                        _view.ItemExistanceChanged (item);
+                    }
+                }
+            }
+        }
+
         public void CloseProject()
         {
+            if (!ProjectOpen)
+                return;
+
             // Make sure we give the user a chance to
             // save the project if they need too.
             if (!AskSaveProject())
                 return;
+
+            if (watcher != null) {
+                watcher.Dispose ();
+                watcher = null;
+            }
 
             ProjectOpen = false;
             ProjectDirty = false;
             _project = null;
             _actionStack.Clear();
             _view.OutputClear();
+
+            History.Default.StartupProject = null;
+            History.Default.Save();
 
             Selection.Clear(this);
             UpdateTree();
@@ -265,7 +332,14 @@ namespace MonoGame.Tools.Pipeline
             // Do the save.
             ProjectDirty = false;
             var parser = new PipelineProjectParser(this, _project);
-            parser.SaveProject();            
+            parser.SaveProject();
+
+            // Note: This is where a project loaded via 'new project' or 'import project' 
+            //       get recorded into history because up until this point they did not
+            //       exist as files on disk.
+            History.Default.AddProjectHistory(_project.OriginalPath);
+            History.Default.StartupProject = _project.OriginalPath;
+            History.Default.Save();
 
             return true;
         }
@@ -354,7 +428,7 @@ namespace MonoGame.Tools.Pipeline
             {
                 var mgcbPath = Path.Combine(root, "MGCB.exe");
                 if (File.Exists(mgcbPath))
-                    return mgcbPath;
+                    return Path.GetFullPath(mgcbPath);
             }
 
             throw new FileNotFoundException("MGCB.exe is not in the search path!");
@@ -365,10 +439,8 @@ namespace MonoGame.Tools.Pipeline
             try
             {
                 // Prepare the process.
-                _buildProcess = new Process();
+                _buildProcess = _view.CreateProcess(FindMGCB(), commands);
                 _buildProcess.StartInfo.WorkingDirectory = Path.GetDirectoryName(_project.OriginalPath);
-                _buildProcess.StartInfo.FileName = FindMGCB();
-                _buildProcess.StartInfo.Arguments = commands;
                 _buildProcess.StartInfo.CreateNoWindow = true;
                 _buildProcess.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
                 _buildProcess.StartInfo.UseShellExecute = false;
@@ -553,7 +625,7 @@ namespace MonoGame.Tools.Pipeline
             PipelineTypes.Load(_project);
             foreach (var i in _project.ContentItems)
             {
-                i.Controller = this;
+                i.Observer = this;
                 i.ResolveTypes();
                 _view.UpdateProperties(i);
             }
@@ -585,7 +657,11 @@ namespace MonoGame.Tools.Pipeline
                 if (_templateItems.Any(i => i.Label == item.Label))
                     continue;
 
-                item.TemplateFile = Path.GetFullPath(Path.Combine(path, item.TemplateFile));
+                var fpath = Path.GetDirectoryName(f);
+                item.TemplateFile = Path.GetFullPath(Path.Combine(fpath, item.TemplateFile));
+
+                _view.OnTemplateDefined(item);
+
                 _templateItems.Add(item);
             }
         }
@@ -595,14 +671,22 @@ namespace MonoGame.Tools.Pipeline
             if (_project == null)
                 return filePath;
 
+            #if WINDOWS
             filePath = filePath.Replace("/", "\\");
             if (filePath.StartsWith("\\"))
                 filePath = filePath.Substring(2);
+            #endif
 
             if (Path.IsPathRooted(filePath))
                 return filePath;
 
+            #if WINDOWS
             return _project.Location + "\\" + filePath;
+            #endif
+
+            #if LINUX || MONOMAC
+            return _project.Location + "/" + filePath;
+            #endif
         }
     }
 }
